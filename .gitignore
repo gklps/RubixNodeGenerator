@@ -1,0 +1,19 @@
+# Ignore build artifacts
+rubix-setup
+
+# Test directories
+/test
+/test-old
+
+# macOS
+.DS_Store
+
+# Go build
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# VSCode
+.vscode/
