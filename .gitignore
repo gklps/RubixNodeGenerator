@@ -17,3 +17,7 @@ rubix-setup
 
 # VSCode
 .vscode/
+
+# Test Folders
+/test
+/test-old

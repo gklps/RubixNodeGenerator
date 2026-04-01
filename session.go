@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 )
 
 // ─────────────────────────────────────────────
@@ -158,10 +159,11 @@ func runCommandMenu(installPath string, sc *savedConfig, mapping *didMapping) {
 		fmt.Println("  5 - Show node status            (ports, screen sessions)")
 		fmt.Println("  6 - Show DID mapping            (from did_mapping.json)")
 		fmt.Println("  7 - Shutdown all nodes          (graceful shutdown)")
+		fmt.Println("  8 - Add new normal nodes        (launch + create DID)")
 		fmt.Println("  0 - Exit")
 		fmt.Println("────────────────────────────────────────────────────────────")
 
-		choice := readInt("Your choice: ", 0, 7)
+		choice := readInt("Your choice: ", 0, 8)
 
 		switch choice {
 		case 1:
@@ -178,6 +180,8 @@ func runCommandMenu(installPath string, sc *savedConfig, mapping *didMapping) {
 			cmdShowDIDMapping(mapping)
 		case 7:
 			runKillAllNodes(installPath)
+		case 8:
+			cmdAddNodes(installPath, sc, &mapping)
 		case 0:
 			fmt.Println("\nExiting session manager. Nodes continue running in the background.")
 			return
@@ -746,4 +750,138 @@ func loadDIDMapping(path string) (*didMapping, error) {
 		return nil, err
 	}
 	return &m, nil
+}
+
+// ─────────────────────────────────────────────
+// cmdAddNodes launches additional normal nodes, creates one DID each,
+// appends them to did_mapping.json, and updates normal_nodes in config.json.
+// ─────────────────────────────────────────────
+func cmdAddNodes(installPath string, sc *savedConfig, mappingPtr **didMapping) {
+	fmt.Println()
+	fmt.Println("═══ Add New Normal Nodes ═══")
+
+	count := readIntDefault(
+		"  How many normal nodes to add? (Press Enter for default 1): ",
+		1, 100, 1,
+	)
+
+	newNodes := buildNewNormalNodes(sc, count)
+	printNodePlan(newNodes)
+
+	if !readYesNo("\nProceed to launch? [Y/n]: ") {
+		printWarn("Cancelled.")
+		return
+	}
+
+	// Launch each new node
+	testNet := sc.Network == "testnet"
+	for _, n := range newNodes {
+		nodePath := filepath.Join(installPath, filepath.FromSlash(n.Path))
+		if err := ensureDir(nodePath); err != nil {
+			printWarn(fmt.Sprintf("Could not create dir for %s: %v", n.Name, err))
+			return
+		}
+		if !isPortAvailable(n.Port) {
+			printWarn(fmt.Sprintf("Port %d is already in use (%s). Aborting.", n.Port, n.Name))
+			return
+		}
+		if !isPortAvailable(n.GrpcPort) {
+			printWarn(fmt.Sprintf("gRPC port %d is already in use (%s). Aborting.", n.GrpcPort, n.Name))
+			return
+		}
+		printProgress(fmt.Sprintf("Launching %s (port=%d grpcPort=%d)...", n.Name, n.Port, n.GrpcPort))
+		if err := launchNode(installPath, n, testNet); err != nil {
+			printWarn(fmt.Sprintf("Failed to launch %s: %v", n.Name, err))
+			return
+		}
+		printSuccess(fmt.Sprintf("Node %s started. Log: %s.txt", n.Name, n.Name))
+	}
+
+	// Wait for nodes to boot before creating DIDs
+	promptWaitForNodes()
+
+	// Create one DID per new node
+	var newRecords []nodeDIDRecord
+	for _, n := range newNodes {
+		printProgress(fmt.Sprintf("Creating DID on %s (port=%d)...", n.Name, n.Port))
+		rec := nodeDIDRecord{
+			Name:      n.Name,
+			Path:      n.Path,
+			HTTPPort:  n.Port,
+			GrpcPort:  n.GrpcPort,
+			NodeIndex: n.NodeIndex,
+			IsQuorum:  false,
+			DIDs:      []string{},
+		}
+		did, err := createDID(installPath, n.Port)
+		if err != nil {
+			printWarn(fmt.Sprintf("  DID creation failed on %s: %v", n.Name, err))
+		} else {
+			rec.DIDs = append(rec.DIDs, did)
+			printSuccess(fmt.Sprintf("  DID created: %s", did))
+		}
+		newRecords = append(newRecords, rec)
+	}
+
+	// Update or create the in-memory mapping and persist it
+	if *mappingPtr == nil {
+		*mappingPtr = &didMapping{
+			Network:   sc.Network,
+			CreatedAt: time.Now().UTC().Format(time.RFC3339),
+			Nodes:     []nodeDIDRecord{},
+		}
+	}
+	(*mappingPtr).Nodes = append((*mappingPtr).Nodes, newRecords...)
+	if err := saveDIDMapping(installPath, **mappingPtr); err != nil {
+		printWarn(fmt.Sprintf("Could not update did_mapping.json: %v", err))
+	}
+
+	// Bump normal_nodes in config.json
+	sc.NormalNodes += count
+	if err := updateNormalNodesInConfig(installPath, sc.NormalNodes); err != nil {
+		printWarn(fmt.Sprintf("Could not update config.json: %v", err))
+	} else {
+		printSuccess(fmt.Sprintf("config.json updated: normal_nodes=%d", sc.NormalNodes))
+	}
+}
+
+// buildNewNormalNodes returns nodeInfo structs for the nodes to be added,
+// continuing the global index from where the existing setup left off.
+func buildNewNormalNodes(sc *savedConfig, count int) []nodeInfo {
+	nodes := make([]nodeInfo, 0, count)
+	startGlobal := sc.QuorumNodes + sc.NormalNodes
+	for i := 0; i < count; i++ {
+		globalIdx := startGlobal + i
+		offset := globalIdx * sc.PortGap
+		nodeNum := sc.NormalNodes + 1 + i
+		nodes = append(nodes, nodeInfo{
+			Name:      fmt.Sprintf("node%d", nodeNum),
+			Path:      fmt.Sprintf("Node/node%d", nodeNum),
+			NodeIndex: offset,
+			Port:      sc.BasePort + offset,
+			GrpcPort:  sc.BaseGrpc + offset,
+			IsQuorum:  false,
+		})
+	}
+	return nodes
+}
+
+// updateNormalNodesInConfig updates only normal_nodes in config.json,
+// preserving all other fields (platform, ipfs_version, etc.).
+func updateNormalNodesInConfig(installPath string, newCount int) error {
+	cfgPath := filepath.Join(installPath, "config.json")
+	data, err := os.ReadFile(cfgPath)
+	if err != nil {
+		return err
+	}
+	var raw map[string]interface{}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	raw["normal_nodes"] = newCount
+	b, err := json.MarshalIndent(raw, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(cfgPath, b, 0o644)
 }
